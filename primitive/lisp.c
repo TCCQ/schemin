@@ -12,9 +12,11 @@
 #define kCdr        37
 #define kCons       41
 #define kEq         46
+#define kGetc       49
+#define kPutc       54
 
 #define M (RAM + sizeof(RAM) / sizeof(RAM[0]) / 2)
-#define S "NIL\0T\0QUOTE\0COND\0READ\0PRINT\0ATOM\0CAR\0CDR\0CONS\0EQ"
+#define S "NIL\0T\0QUOTE\0COND\0READ\0PRINT\0ATOM\0CAR\0CDR\0CONS\0EQ\0GETC\0PUTC"
 
 // if sign bit is set, it's a pointer to a cell, if not it's an atom
 typedef int cell;
@@ -206,7 +208,7 @@ cell eval_cond(cell c, cell a) {
 cell apply(cell f, cell x, cell a) {
   if (f < 0) return eval(car(cdr(cdr(f))),
                          pair_list(car(cdr(f)), x, a));
-  if (f > kEq) return apply(eval(f, a), x, a);
+  if (f > kPutc) return apply(eval(f, a), x, a);
   if (f == kEq) return car(x) == car(cdr(x)) ? kT : 0;
   if (f == kCons) return cons(car(x), car(cdr(x)));
   if (f == kAtom) return car(x) < 0 ? 0 : kT;
@@ -214,6 +216,8 @@ cell apply(cell f, cell x, cell a) {
   if (f == kCdr) return cdr(car(x));
   if (f == kRead) return read();
   if (f == kPrint) return (x ? print(car(x)) : print_ln()), 0;
+  if (f == kGetc) return lisp_getchar(), dx;
+  if (f == kPutc) return inner_putchar((char) car(x)), 0;
 }
 
 // select action and do it, cleaning garbage if allocations occured.
