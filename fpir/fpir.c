@@ -60,6 +60,7 @@ void panic(char* msg) {
 
 ulong *tospace, *fromspace, *HP;
 ulong* copy(ulong* obj) {
+  if (obj == -1) return -1;
   ulong* newaddr;
   if (TAG_MASK(FST(obj)) == GC_FWD_TAG) return SND(obj);
   FST(HP) = FST(obj);
@@ -82,8 +83,14 @@ void collect(ulong** env) {
 
   *env = copy(*env);
 
-  for (ulong** a = (ulong**)(M+SSTART-16); a >= (ulong**)SP; a-=2) {
-    *a = copy(*a);
+  for (ulong* a = (ulong*)(M+SSTART-16); a >= (ulong*)SP; a-=2) {
+    if (TAG_MASK(FST(a)) == CONS_TAG) {
+      FST(a) = copy(FST(a));
+      SND(a) = copy(SND(a));
+    } else if (TAG_MASK(FST(a)) == PROC_TAG) {
+      FST(a) = ((ulong)copy(FST(a))) | PROC_TAG;
+      SND(a) = copy(SND(a));
+    }
   }
 
   while (scan < HP) {
@@ -104,10 +111,10 @@ void collect(ulong** env) {
 }
 
 ulong* new_cons(ulong a, ulong b) {
-  if (HP + 2 > fromspace + SEMIHEAPSIZE) {
+  if (HP + 2 >= ((ulong)fromspace) + SEMIHEAPSIZE) {
     collect(&env);
   }
-  if (HP + 2 > fromspace + SEMIHEAPSIZE) {
+  if (HP + 2 >= ((ulong)fromspace) + SEMIHEAPSIZE) {
     panic("OOM!");
   }
   FST(HP) = a;
@@ -345,8 +352,10 @@ ulong extend(ulong* env, ulong* sym, ulong* val) {
 }
 
 void eval(ulong**,ulong*);
-void compute(ulong** env, ulong* body) {
-  while (body != -1) {
+// evaluate the body, returning the tail call
+ulong* compute(ulong** env, ulong* body) {
+  if (body == -1) panic("Empty body in compute");
+  while (SND(body) != -1) {
     ulong* cmd = FST(body);
     body = SND(body);
     if ((TAG_MASK(FST(cmd)) == SYM_TAG) &&
@@ -360,9 +369,11 @@ void compute(ulong** env, ulong* body) {
       eval(env, cmd);
     }
   }
+  return FST(body);
 }
 
 void eval(ulong** env, ulong* cur) {
+ eval_start:
   if (SP-2 <= DP) panic("Stack overflow!");
   ulong l;
   if (cur == -1) {
@@ -386,7 +397,8 @@ void eval(ulong** env, ulong* cur) {
       *(--SP) = -1;
       *(--SP) = CONS_TAG;
     } else {
-      eval(env, l);
+      cur = l;
+      goto eval_start;
     }
     break;
   case INT_TAG:
@@ -397,9 +409,10 @@ void eval(ulong** env, ulong* cur) {
     {
       ulong* capenv = ADDR_MASK(FST(cur));
       ulong* body = SND(cur);
-      compute(&capenv, body);
-      FST(cur) = (ulong)capenv | PROC_TAG; // write back changes
-      break;
+      ulong* tailcall = compute(&capenv, body);
+      env = &capenv;
+      cur = tailcall;
+      goto eval_start;
     }
   case PRIM_TAG:
     ((stack_func)(SND(cur)))(env);
