@@ -1,3 +1,43 @@
+/********************************************************************/
+/*                 On reading and editing this file                 */
+/*                                                                  */
+/* The C in this file is extremely delicate. This file should be    */
+/* compiled without optimizations, and seemingly quick fixes on the */
+/* programmer's part should be considered *very* carefully. This is */
+/* entirely because of new_cons. This is because new_cons returns   */
+/* pointers to interally garbage collected regions of memory, the   */
+/* lifetime of which follows the follwing rules:                    */
+/*                                                                  */
+/* A pointer to a cons cell (16 bytes) returned by new_cons is      */
+/* valid until the next time garbage collection happens. If the     */
+/* cons cell is referenced in a legal way (as a child of a cons     */
+/* cell or a proc tagged cell) from a root, the cons cell survives  */
+/* garbage collection and continues to be valid memory which will   */
+/* not be re-alloced for another purpose. Garbage collection        */
+/* happens when the heap runs out of space, which is checked on     */
+/* *every* new_cons call.                                           */
+/*                                                                  */
+/* This means that when performing any sort of manipulation between */
+/* valid static states of the abstract state machine,               */
+/*                                                                  */
+/* ONLY ONE VALUE RETURNED BY new_cons SHOULD BE FLOATING AT A TIME */
+/*                                                                  */
+/* Best practice is to place the floating value on the state        */
+/* machine stack before calling new_cons again, as all valid stack  */
+/* slots are roots. To facilitate the construction of linked data   */
+/* between abstract state machine states, NULL (0) is a valid child */
+/* pointer from cons cells, and will be ignored by the garbage      */
+/* collector. Note that it is *not* a valid pointer for a cons      */
+/* cell as it would be used by the abstract state machine. NIL has  */
+/* its own representation.                                          */
+/*                                                                  */
+/* More details about the thought process behind this decision can  */
+/* be found here: [gc.org]                                          */
+/*                                                                  */
+/* If reading this file can make even one rustacean feel ill, it    */
+/* will all have been worth it. :P                                  */
+/********************************************************************/
+
 #ifndef BAREMETAL
 #include <stdio.h>
 void putstring(char* s) {fputs(s, stdout);}
@@ -32,10 +72,14 @@ extern char* M;
 #else
 char M[MEMSIZE];
 #endif
-
-typedef void (*stack_func)(ulong** env);
-ulong *SP, *env;
+ulong *SP, *env, *cur_eval;
 char *DP;
+
+typedef struct cell {
+  ulong car;
+  ulong cdr;
+} cell;
+typedef void (*stack_func)(ulong** env);
 
 #define CONS_TAG   0
 #define SYM_TAG    1
@@ -43,6 +87,7 @@ char *DP;
 #define PROC_TAG   3
 #define PRIM_TAG   4
 #define GC_FWD_TAG 5
+#define NIL_TAG    6
 
 #ifdef BAREMETAL
 extern void print_err(char*);
@@ -60,8 +105,8 @@ void panic(char* msg) {
 
 ulong *tospace, *fromspace, *HP;
 ulong* copy(ulong* obj) {
-  if (obj == -1) return -1;
-  ulong* newaddr;
+  if (!obj) return obj;         /* NULL is valid */
+  ulong* newaddr = HP;
   if (TAG_MASK(FST(obj)) == GC_FWD_TAG) return SND(obj);
   FST(HP) = FST(obj);
   SND(HP) = SND(obj);
@@ -69,9 +114,15 @@ ulong* copy(ulong* obj) {
   HP += 2;
   FST(obj) = GC_FWD_TAG;
   SND(obj) = newaddr;
+  ulong tag = TAG_MASK(FST(newaddr));
+  if (tag == CONS_TAG || tag == PROC_TAG) {
+    FST(newaddr) = (ulong)copy(ADDR_MASK(FST(newaddr))) | tag;
+    SND(newaddr) = copy(ADDR_MASK(SND(newaddr)));
+  }
   return newaddr;
 }
 
+cell read_stack;
 void collect(ulong** env) {
   print_err("GC!");
   ulong* scan;
@@ -82,6 +133,11 @@ void collect(ulong** env) {
   scan = fromspace;
 
   *env = copy(*env);
+  if (TAG_MASK(read_stack.car) == CONS_TAG) {
+    read_stack.car = copy(read_stack.car);
+    read_stack.cdr = copy(read_stack.cdr);
+  }
+  cur_eval = copy(cur_eval);
 
   for (ulong* a = (ulong*)(M+SSTART-16); a >= (ulong*)SP; a-=2) {
     if (TAG_MASK(FST(a)) == CONS_TAG) {
@@ -216,60 +272,124 @@ char* OPAREN_SYM;
 char* CPAREN_SYM;
 char* T_SYM;
 
+/* This call may look odd and doesn't fit the style of the rest of the
+   code because we need the property that between new_cons calls
+   allocated cells must be reachable from a root. See gc.org for a
+   more detailed explination. */
 void p_push(ulong**);
 void p_pops(ulong**);
 void p_pope(ulong**);
-ulong* read_stack = -1;
-ulong* read() {
-  ulong* ret;
-  if (read_stack != -1) {
-    ret = FST(read_stack);
-    read_stack = SND(read_stack);
+cell read_stack = {NIL_TAG,0};
+/* DO NOT TOUCH */
+#define STARTREADSTACK()                                \
+  {                                                     \
+    *(--SP) = read_stack.cdr;                           \
+    *(--SP) = read_stack.car;                           \
+  }
+
+#define PUSHREADSTACK(contents)                         \
+  {                                                     \
+  *(SP-1) = new_cons(*SP, *(SP+1));                     \
+  *(SP-2) = CONS_TAG;                                   \
+  SP-=2;                                                \
+  cell _h = contents;                                   \
+  FST(SP) = (ulong)new_cons(_h.car, _h.cdr) | CONS_TAG; \
+  *(SP+1) = *SP;                                        \
+  *(SP+2) = *(SP+1);                                    \
+  SP+=2;                                                \
+  }
+
+#define SAVEREADSTACK()                                 \
+  read_stack.car = *SP;                                 \
+  read_stack.cdr = *(SP+1);                             \
+  SP+=2
+
+cell read() {
+  cell ret;
+  if (read_stack.car != NIL_TAG) {
+    ulong* h = read_stack.car;
+    ret.car = FST(h);
+    ret.cdr = SND(h);
+    read_stack.car = FST(read_stack.cdr);
+    read_stack.cdr = SND(read_stack.cdr);
+    return ret;
   } else {
     slurp_whitespace();
     char* raw_sym = read_token();
-    if (raw_sym == SQUOTE_SYM || raw_sym == QUOTE_SYM) {
-      read_stack = new_cons(read(), read_stack);
-      ret = new_cons(SYM_TAG, QUOTE_SYM);
+    if (raw_sym == SQUOTE_SYM) {
+      cell out = {SYM_TAG, QUOTE_SYM};
+      return out;
+    } else if (raw_sym == QUOTE_SYM) {
+      STARTREADSTACK();
+      PUSHREADSTACK(read());
+      SAVEREADSTACK();
+      cell out = {SYM_TAG, QUOTE_SYM};
+      return out;
     } else if (raw_sym == SPUSH_SYM) {
-      read_stack = new_cons(read(),
-                            new_cons(new_cons(SYM_TAG, PUSH_SYM),
-                                     read_stack));
-      ret = new_cons(SYM_TAG, QUOTE_SYM);
+      STARTREADSTACK();
+      PUSHREADSTACK(read());
+      SAVEREADSTACK();
+      cell out = {SYM_TAG, QUOTE_SYM};
+      return out;
     } else if (raw_sym == SPOP_SET_SYM) {
-      read_stack = new_cons(read(),
-                            new_cons(new_cons(SYM_TAG, POP_SET_SYM),
-                                     read_stack));
-      ret = new_cons(SYM_TAG, QUOTE_SYM);
+      STARTREADSTACK();
+      cell rs = {SYM_TAG, POP_SET_SYM};
+      PUSHREADSTACK(rs);
+      PUSHREADSTACK(read());
+      SAVEREADSTACK();
+      cell out = {SYM_TAG, QUOTE_SYM};
+      return out;
     } else if (raw_sym == SPOP_EXT_SYM) {
-      read_stack = new_cons(read(),
-                            new_cons(new_cons(SYM_TAG, POP_EXT_SYM),
-                                     read_stack));
-      ret = new_cons(SYM_TAG, QUOTE_SYM);
+      STARTREADSTACK();
+      cell rs = {SYM_TAG, POP_EXT_SYM};
+      PUSHREADSTACK(rs);
+      PUSHREADSTACK(read());
+      SAVEREADSTACK();
+      cell out = {SYM_TAG, QUOTE_SYM};
+      return out;
     } else if (raw_sym == OPAREN_SYM) {
+      /* This is weird but forces the allocation to happen in order,
+         interleaved with placing the location on the stack so it is
+         reachable. */
+      ulong* stack_marker = SP;
       ret = read();
-      if (ret == -1) return -1;
-      ulong* head = new_cons(ret, -1);
-      ulong* tail = head;
-      while ((ret = read()) != -1) {
-        tail = SND(tail) = new_cons(ret, -1);
+      if (ret.car == NIL_TAG) return ret;
+      while (ret.car != NIL_TAG) {
+        *(--SP) = 0;
+        --SP;
+        *SP = (ulong)new_cons(ret.car, ret.cdr) | CONS_TAG;
+        *(SP+1) = new_cons(NIL_TAG, 0);
+        ret = read();
       }
-      ret = head;
+      // The list is read into the stack, now collect it up
+      while (SP < stack_marker-2) {
+        *(SP+3) = new_cons(*(SP), *(SP+1));
+        SP += 2;
+      }
+      cell out = {FST(SP), SND(SP)};
+      SP+=2;
+      return out;
     } else if (raw_sym == CPAREN_SYM) {
-      ret = -1;
+      cell out = {NIL_TAG, 0};
+      return out;
     } else {
       char* cstr = raw_sym;
       struct as_int_t maybe_int = as_int(cstr);
-      if (maybe_int.b) ret = new_cons(INT_TAG, maybe_int.v);
-      else ret = new_cons(SYM_TAG, raw_sym);
+      if (maybe_int.b) {        // C struct return type moment :( ugly
+        cell out = {INT_TAG, maybe_int.v};
+        return out;
+      } else {
+        cell out = {SYM_TAG, raw_sym};
+        return out;
+      }
     }
   }
-  return ret;
 }
 
 void print(ulong*, char);
 void print_list(ulong* l) {
-  while (l != -1 && (TAG_MASK(FST(l)) == CONS_TAG)) {
+  if (!l) panic("NULL head in print_list");
+  while ((TAG_MASK(FST(l)) != NIL_TAG) && (TAG_MASK(FST(l)) == CONS_TAG)) {
     print(FST(l), 0);
     if (SND(l) != -1) putchar(' ');
     l = SND(l);
@@ -278,7 +398,7 @@ void print_list(ulong* l) {
 #define pow(a,b) {typeof(a) _val=1; typeof(b) _b = b; while(_b--) _val*=a; _val;}
 void print_int(ulong val) {
   if ((long long) val < 0) putchar('-');
-  val &= ~(1ul << 63);
+  val &= ~(1ULL << 63);
   for (int s = 19; s >= 0; --s) {
     int c = (val / (pow(10, s))) % 10;
     putchar((char)(c + '0'));
@@ -286,9 +406,11 @@ void print_int(ulong val) {
 }
 void print(ulong* v, char newline) {
   switch (TAG_MASK(FST(v))) {
+  case NIL_TAG:
+    putstring("nil");
+    break;
   case CONS_TAG:
-    if (ADDR_MASK(FST(v)) == -1 && SND(v) == -1) putstring("nil");
-    else if (TAG_MASK(FST(SND(v))) != CONS_TAG) {
+    if (TAG_MASK(FST(SND(v))) != CONS_TAG) {
       putchar('(');
       print(FST(v), 0);
       putstring(" . ");
@@ -321,20 +443,24 @@ void print(ulong* v, char newline) {
 }
 
 ulong* lookup(ulong* env, char* raw_sym) {
-  do {
+  if (!env) panic("NULL env in lookup!");
+  while (TAG_MASK(FST(env)) == CONS_TAG) {
     ulong* pair = FST(env);
     ulong* cursym = FST(pair);
     ulong _len;
     if (streq(&_len, (char*)SND(cursym), raw_sym)) {
       return SND(pair);
     }
-  } while ((env = SND(env)) != -1);
+    env = SND(env);
+  }
+  if (TAG_MASK(FST(env)) != NIL_TAG) panic("Mallformed env in lookup!");
   print_err((char*)raw_sym);
   panic(": undefined symbol (lookup)!");
 }
 void set(ulong* env, ulong* sym, ulong* val) {
   // NOTE not safe if val is a stack pointer, needs to be a heap cell
-  do {
+  if (!env) panic("NULL env in set!");
+  while (TAG_MASK(FST(env)) == CONS_TAG) {
     ulong* pair = FST(env);
     ulong* cursym = FST(pair);
     ulong _len;
@@ -342,25 +468,34 @@ void set(ulong* env, ulong* sym, ulong* val) {
       SND(pair) = val;
       return;
     }
-  } while ((env = SND(env)) != -1);
+    env = SND(env);
+  }
+  if (TAG_MASK(FST(env)) != NIL_TAG) panic("Mallformed env in set!");
   print_err((char*)SND(sym));
   panic(": undefined symbol (set)!");
 }
 ulong extend(ulong* env, ulong* sym, ulong* val) {
   // NOTE not safe if val is a stack pointer, needs to be a heap cell
-  return new_cons(new_cons(sym, val), env);
+  ulong* v = new_cons(sym, val);
+  SP-=2;
+  *SP = CONS_TAG;
+  *(SP+1) = v;
+  ulong* out = new_cons(*(SP+1), env);
+  SP+=2;
+  return out;
 }
 
 void eval(ulong**,ulong*);
 // evaluate the body, returning the tail call
 ulong* compute(ulong** env, ulong* body) {
-  if (body == -1) panic("Empty body in compute");
-  while (SND(body) != -1) {
+  if (!body) panic("NULL body in compute!");
+  if (TAG_MASK(FST(body)) == NIL_TAG) panic("Empty body in compute");
+  while (FST(SND(body)) != NIL_TAG) {
     ulong* cmd = FST(body);
     body = SND(body);
     if ((TAG_MASK(FST(cmd)) == SYM_TAG) &&
         (char*)SND(cmd) == QUOTE_SYM) {
-      if (body == -1) panic("No data after quote");
+      if (TAG_MASK(FST(body)) == NIL_TAG) panic("No data after quote");
       ulong* sym = FST(body);
       *(--SP) = SND(sym);
       *(--SP) = SYM_TAG;
@@ -375,29 +510,27 @@ ulong* compute(ulong** env, ulong* body) {
 void eval(ulong** env, ulong* cur) {
  eval_start:
   if (SP-2 <= DP) panic("Stack overflow!");
-  ulong l;
-  if (cur == -1) {
-    // push nil
-    *(--SP) = -1;
-    *(--SP) = (ulong)ADDR_MASK(-1) | CONS_TAG;
-  }
+  if (!cur) panic("NULL in eval!");
   switch (TAG_MASK(FST(cur))) {
+  case NIL_TAG:
+    *(--SP) = 0;
+    *(--SP) = NIL_TAG;
+    break;
   case CONS_TAG:
-    *(--SP) = (ulong)cur;
-    *(--SP) = (ulong)(*env) | PROC_TAG;
+    *(--SP) = (ulong)(*env);
+    *(--SP) = (ulong)cur | PROC_TAG;
     break;
   case SYM_TAG:
     // We catch this in both eval and in compute. So we know if we
     // catch it here it has to be a top-level
     if (SND(cur) == QUOTE_SYM) {
-      ulong* sym = read();
-      *(--SP) = SND(sym);
-      *(--SP) = FST(sym);
-    } else if ((l = lookup(*env, SND(cur))) == -1) {
-      *(--SP) = -1;
-      *(--SP) = CONS_TAG;
+      cell sym = read();
+      if ((sym.car != SYM_TAG))
+        panic("non-symbol following quote");
+      *(--SP) = sym.cdr;
+      *(--SP) = sym.car;
     } else {
-      cur = l;
+      cur = lookup(*env, SND(cur));
       goto eval_start;
     }
     break;
@@ -407,11 +540,8 @@ void eval(ulong** env, ulong* cur) {
     break;
   case PROC_TAG:
     {
-      ulong* capenv = ADDR_MASK(FST(cur));
-      ulong* body = SND(cur);
-      ulong* tailcall = compute(&capenv, body);
-      env = &capenv;
-      cur = tailcall;
+      env = &SND(cur);
+      cur = compute(env, ADDR_MASK(FST(cur)));
       goto eval_start;
     }
   case PRIM_TAG:
@@ -431,6 +561,8 @@ void p_push(ulong** env) {
 void p_pope(ulong** env) {
   if (*SP != SYM_TAG) panic("pope on non-sym!");
   ulong* s = new_cons(*SP, *(SP+1));
+  *(SP) = CONS_TAG;
+  *(SP+1) = s;
   ulong* tmp = new_cons(*(SP+2), *(SP+3));
   SP+=4;
   *env = extend(*env, s, tmp);
@@ -438,6 +570,8 @@ void p_pope(ulong** env) {
 void p_pops(ulong** env) {
   if (*SP != SYM_TAG) panic("pops on non-sym!");
   ulong* s = new_cons(*SP, *(SP+1));
+  *(SP) = CONS_TAG;
+  *(SP+1) = s;
   ulong* tmp = new_cons(*(SP+2), *(SP+3));
   SP+=4;
   set(*env, s, tmp);
@@ -450,12 +584,14 @@ void p_eq(ulong** env) {
     *SP = SYM_TAG;
     *(SP+1) = T_SYM;
   } else {
-    *SP = (ulong)ADDR_MASK(-1) | CONS_TAG;
-    *(SP+1) = -1;
+    *SP = NIL_TAG;
+    *(SP+1) = 0;
   }
 }
 void p_cons(ulong** env) {
   ulong* car = new_cons(*SP, *(SP+1));
+  *SP = CONS_TAG;
+  *(SP+1) = car;
   ulong* cdr = new_cons(*(SP+2), *(SP+3));
   SP+=2;
   *SP = ((ulong)car) | CONS_TAG;
@@ -489,14 +625,9 @@ void p_tag(ulong** env) {
   *SP = INT_TAG;
 }
 void p_read(ulong** env) {
-  ulong* h = read();
-  if (h == -1) {
-    *(--SP) = -1;
-    *(--SP) = CONS_TAG;
-  } else {
-    *(--SP) = *(h+1);
-    *(--SP) = *(h);
-  }
+  cell h = read();
+  *(--SP) = h.cdr;
+  *(--SP) = h.car;
 }
 void p_print(ulong** env) {
   print(SP, 1);
@@ -577,19 +708,22 @@ void p_store(ulong** env) {
   if (TAG_MASK(*SP) != INT_TAG || TAG_MASK(*(SP+2)) != INT_TAG) panic("Non-int in store");
   ulong* addr = (ulong*) *(SP+1);
   SP+=2;
-  *(SP+1) = *addr;
+  *addr = *(SP+1);
 }
-void p_obj_to_ptr(ulong** env) {
-  *(SP+1) = (ulong) new_cons(*SP, *(SP+1));
-  *SP = INT_TAG;
-}
-void p_ptr_to_obj(ulong** env) {
-  if (TAG_MASK(*SP) != INT_TAG) panic("Non-int in ptr_to_obj");
-  *SP = *((ulong*) *(SP+1));
-  *(SP+1) = *(((ulong*) *(SP+1)) + 1);
-}
+/*
+ * void p_obj_to_ptr(ulong** env) {
+ *   *(SP+1) = (ulong) new_cons(*SP, *(SP+1));
+ *   *SP = INT_TAG;
+ * }
+ * void p_ptr_to_obj(ulong** env) {
+ *   if (TAG_MASK(*SP) != INT_TAG) panic("Non-int in ptr_to_obj");
+ *   *SP = *((ulong*) *(SP+1));
+ *   *(SP+1) = *(((ulong*) *(SP+1)) + 1);
+ * }
+ */
 
 ulong* env_define_prim(ulong* env, char* raw_sym, stack_func prim) {
+  // FOR USE ONLY IN STARTUP. NOT GC SAFE
   return new_cons(new_cons(new_cons(SYM_TAG, raw_sym),
                            new_cons(PRIM_TAG, prim)),
                   env);
@@ -598,7 +732,6 @@ ulong* env_define_prim(ulong* env, char* raw_sym, stack_func prim) {
 void strcpy_inc(char** dest, char* src) {
   while (*((*dest)++) = *src++) {}
 }
-
 
 int forsp_main() {
   SP = M+SSTART;
@@ -664,15 +797,22 @@ int forsp_main() {
 
   BAKE_DEF("load", p_load);
   BAKE_DEF("store", p_store);
-  BAKE_DEF("obj_to_ptr", p_obj_to_ptr);
-  BAKE_DEF("ptr_to_obj", p_ptr_to_obj);
+  // BAKE_DEF("obj_to_ptr", p_obj_to_ptr);
+  // BAKE_DEF("ptr_to_obj", p_ptr_to_obj);
 
-  DP = (ulong*)dict;
+  DP = dict;
 
   read_char();                  // clear the dummy peek char
 
+  cell tp_lit_cell;
+  cur_eval = 0;
   while (1) {
-    eval(&env, read());
+    tp_lit_cell = read();
+    *(--SP) = tp_lit_cell.cdr;
+    *(--SP) = tp_lit_cell.car;
+    cur_eval = new_cons(tp_lit_cell.car, tp_lit_cell.cdr);
+    SP+=2;
+    eval(&env, cur_eval);
   }
 }
 
