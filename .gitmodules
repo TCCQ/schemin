@@ -1,0 +1,3 @@
+[submodule "fpir/musl"]
+	path = fpir/musl
+	url = git://git.musl-libc.org/musl
