@@ -806,6 +806,7 @@ void p_pope (void) {
 }
 void p_pops (void) {
   if (*SP != SYM_TAG) panic("pops on non-sym!");
+  char* target = (char*)SP[1];
   ulong* s = new_cons(*SP, *(SP+1));
   *(SP) = (ulong)s | CONS_TAG;
   *(SP+1) = 0;
@@ -816,7 +817,7 @@ void p_pops (void) {
     ulong* pair = FST(env);
     ulong* cursym = FST(pair);
     ulong _len;
-    if (streq(&_len, (char*)*(SP+1), (char*)SND(cursym))) {
+    if (streq(&_len, target, (char*)SND(cursym))) {
       SND(pair) = val;
       SP+=4;
       return;
