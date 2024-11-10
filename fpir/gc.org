@@ -1,0 +1,154 @@
+* On Garbage Collection For Lean Systems
+The question of how memory management should work is ever-present in
+language design. How a language thinks about its memory and how the
+responsibilities governing the correct semantics of a program are
+divided between the language, the compiler if there is one, and the
+programmer have a profound effect on the feel of a language. These
+decisions direct what will become natural and idiomatic, and go a long
+way on defining the set of things a programmer might /want/ to write
+in the language.
+
+The most significant single determination when talking about memory is
+whether the language features and/or encourages the use of garbage
+collection. In general this choice is one of trading some control and
+some efficiency (often surrendering the former leads to the latter)
+for conceptual niceness. When the programmer no longer needs to
+concern themselves over lifetimes and ownership of her data, she can
+think directly and undistractedly about the actual core problem her
+program is to solve. The question of if that clarity is worth some
+runtime cost is deferred to every other corner of the internet arguing
+over programming languages. Instead, here I am concerned with what
+garbage collection can offer us as low level programmers.
+
+I want to spend some time talking about what my implementation of
+garbage collection looks like, what sorts of problems and decisions it
+lead my overall design towards, and why I feel that the not
+insignificant costs it incurs are worth it.
+
+My goal for this language is to build as nice abstractions as I can
+with as little base as possible. By that I mean that:
+- I should not expect anything from the underlying system. This means
+  that the language should rest naturally on bare metal, and should be
+  almost trivially portable.
+- The language should make it both possible and desirable to program
+  at a high level of abstraction. If my problem lends itself naturally
+  to some elegant functional solution, I should solve it as such
+  without the knowledge of my proximity to the hardware directing my
+  programming style towards something crunchier.
+The astute reader will notice that runtime efficiency is not on that
+list. While efficiency concerns are not entirely waylaid, they are not
+my focus here.
+
+** Implementing Garbage Collection
+Having decided that I want garbage collection in my language, and with
+the knowledge that my language currently operates over cons cells as
+its sole data structure, how should I go about implementing a garbage
+collector that makes sense for a baremetal environment?
+
+With the goals of my language and simplicity top of mind, I chose to
+implement a semi-space allocate. Cheney's {TODO check} algorithm
+provides a simple and reliable implementation. A bump allocator
+ensures that the overhead incurred for each allocation is low, and a
+large total memory size compared to the working set ensures that the
+cost of garbage collection when it happens is amortized.
+
+While it is certainly a large concession to have only half of your
+total memory available at a time, this sort of semispace design shines
+in simplicity and zero overhead. The mark and sweep garbage collector
+means that allocations (which are already type-tagged for other
+reasons), need zero additional data for them garbage-collectable. No
+generational tags, no table of live or dead blocks, no linked list
+stored in free nodes. The program simply has some set of roots, and
+every cons cell reachable from a root is still valid. The natural
+implementation with forwarding pointers even handles cyclical data
+structures cleanly with no additional logic. Garbage collection
+absolutely shreds any possible cache locality by being a breadth first
+search, but a program composed of exclusively cons cells is not
+exactly dense to begin with.
+
+Having extolled the virtues of this system enough, a question remains:
+When does garbage collection happen? It turns out this question is not
+quite as simple to answer as it might sound. An initial guiding
+decision could be that we don't want to claim an out of memory error
+if we don't really have one...
+
+*** The Problem™
+The first thing that comes to mind is simply check each time we
+would allocate if it would allocate past the end of the heap, and if
+so perform garbage collection first. If we would still overflow the
+head after garbage collection, then we truly have run out of memory.
+
+However, calling collect in new_cons when we would overflow is
+unreliable, as there may be valid cons cells that are not yet
+reachable from the roots. These cells will not be copied into the new
+space, and thus will not be valid into the future. Furthermore, even
+if they were copied, if they are not reachable by the root, we can't
+be sure that all the locations with pointers to the cells in question
+will be updated with the new address.
+
+**** Call It Somewhere Else?
+Ideologically I don't want to, since the optimum solution is to only
+call collect when you need to, since it is more efficient as a batch
+operation than run more frequently, even if each invocation does less
+work.
+
+Furthermore there is a correctness problem which is discussed below.
+
+**** A Grace Period Perhaps?
+Fix some finite natural K. Change the new_cons collect check to
+activate any time there are less than K cells left to allocate in the
+current space. There exists a global flag that enables and disables
+this check entirely, effectively turning off garbage collection. When
+collection it re-enabled, the check is performed without waiting for
+the next call to new_cons. The program is correct with effective
+memory (M - K) if it upholds the following invariant:
+
+The program disables garbage collection for sections in which new
+cells are not reachable from the roots before the next call to
+new_cons, and all such sections call new_cons no more than K
+times.
+
+I mean that the program is correct in that a program that upholds the
+invariant under this scheme will never fail because of a lack of
+memory unless the same program would fail under a hypothetical perfect
+garbage collector / allocator which will only fail to allocate more
+memory if the entirety of memory is in use.
+
+In more friendly terms, when the programmer chooses, she can go up to
+K allocations without having them be reachable from a root before
+having to include them and re-enable garbage collection. While not a
+natural solution, these sections should be small and this would give
+the implementer the freedom to make the locally best decision about
+how to handle allocations and build small structures.
+
+**** The snag
+The issue is that we can't uphold the invariant in one specific
+scenario. That scenario is the read call. When ingesting input from
+the user, read needs to produce arbitrarily long lists, which mean
+that any single call to read can recursively produce an unbounded
+number of calls to new_cons.
+
+The solution is to introduce some new root or set of roots that can
+capture the work-in-progress list that read is building. The question
+is then how to efficiently build up lists under the restriction that
+every addition to the list must be navigated to starting at some root,
+since a local reference to a cons cell is not guaranteed to remain
+valid through a second new_cons call (or K new_cons calls).
+
+We also can't use a naive solution like insert at the tail starting
+from the head (root) every time, since the read call producing lists
+is at the heart of ingesting new code. If the program has to run a n^2
+algorithm over the length of each top-level form, any semi-complex
+code will be unacceptably slow to load. Admittedly code loading speed
+is not the most critical metric, but that's no excuse to introduce
+quadratic runtime.
+
+**** Resignation
+So it appears that any finite grace period won't cut it, and some sort
+of infinite grace period seems like asking for trouble. Lets commit to
+garbage collection being a very real possibility as a side effect of
+*every* new_cons call. At least we have the consolation that we are
+really using every last cons cell in each semi-space. What does it
+look like to program in that world?
+
+** The Consequences of Our Actions

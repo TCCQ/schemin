@@ -39,7 +39,9 @@
 /********************************************************************/
 
 // #include <sys/cdefs.h>
-#define SANITY_CHECKS_ENABLED
+
+// #define SANITY_CHECKS_ENABLED
+#define BAREMETAL
 
 #ifdef SANITY_CHECKS_ENABLED
 #define SANITY(body)                            \
@@ -48,12 +50,16 @@
   body
 #else
 #define SANITY(body)
-#define SANITY(body, altbody)                   \
+#define SANITY_ALT(body, altbody)               \
   altbody
 #endif
 
 #define ASSERT(condition, msg)                  \
   if (!(condition)) panic(msg)
+
+#ifdef BAREMETAL
+#include "riscv.h"
+#endif
 
 #ifndef BAREMETAL
 #include <stdio.h>
@@ -82,7 +88,8 @@ _Static_assert (sizeof(ulong*) == 8, "ulong* isn't a 8byte word");
 
 #define MAX_PRINT_DEPTH 8
 
-#define MEMSIZE 0x8000
+#define MEMSIZE 0x200000
+// ^ Approx 2MB
 #ifdef SANITY_CHECKS_ENABLED
 const ulong MIDPOINT = (MEMSIZE/2);
 const ulong DSTART = 0;
@@ -103,7 +110,8 @@ const ulong STACKSIZE = (MEMSIZE/2);
 
 /* must be 16byte aligned */
 #ifdef BAREMETAL
-extern char* M;
+extern char* MAINMEM;
+char *M;
 #else
 char M[MEMSIZE];
 #endif
@@ -167,15 +175,14 @@ cell read_stack;
 
 #ifdef BAREMETAL
 extern void print_err(char*);
+extern void panic(char* msg);
 #else
 void print_err(char* msg) {fputs(msg, stderr);}
-#endif
-void p_sstack (void);
 void panic(char* msg) {
-  // p_sstack(&env);  // just causes further issues
   print_err(msg);
   while (1) {}
 }
+#endif
 
 SANITY(char* logfilename = "mdump.dot";
        FILE* logfilefd;
@@ -248,22 +255,25 @@ void collect() {
          print_err("GC!\n");
          logfilefd = fopen(logfilename, "w+");
          fwrite("digraph {\n", 1, 10, logfilefd);
-         )
-    ulong* scan;
+         );
+  ulong* scan;
   ulong* hold = fromspace;
   fromspace = tospace;
   tospace = hold;
   HP = fromspace;
   scan = fromspace;
 
-  fprintf(logfilefd, "subgraph {\n");
-  fprintf(logfilefd, "subgraph {\n");
-  SANITY(fprintf(logfilefd, "root_env;\nroot_env -> \"%llx\" [color=red];\n", root_env));
+  SANITY(
+         fprintf(logfilefd, "subgraph {\n");
+         fprintf(logfilefd, "subgraph {\n");
+         fprintf(logfilefd, "root_env;\nroot_env -> \"%llx\" [color=red];\n", root_env);
+         );
   root_env = copy(root_env);
-  SANITY(fprintf(logfilefd, "root_env -> \"%llx\";\n", root_env));
-  fprintf(logfilefd, "}\n");
-
-  fprintf(logfilefd, "subgraph {\n");
+  SANITY(
+         fprintf(logfilefd, "root_env -> \"%llx\";\n", root_env);
+         fprintf(logfilefd, "}\n");
+         fprintf(logfilefd, "subgraph {\n");
+         );
   if (TAG_MASK(read_stack.car) == CONS_TAG) {
     SANITY(fprintf(logfilefd, "readstack;\nreadstack -> \"%llx\" [color=\"red:magenta\"];\n", read_stack.car));
     SANITY(fprintf(logfilefd, "readstack -> \"%llx\" [color=\"red:royalblue\"];\n", read_stack.cdr));
@@ -281,9 +291,9 @@ void collect() {
     SANITY(fprintf(logfilefd, "return_stack -> \"%llx\" [color=\"black:magenta\"];\n", return_stack.car));
     SANITY(fprintf(logfilefd, "return_stack -> \"%llx\" [color=\"black:royalblue\"];\n", return_stack.cdr));
   }
-  fprintf(logfilefd, "}\n");
 
   SANITY(
+         fprintf(logfilefd, "}\n");
          fprintf(logfilefd, "subgraph {\n");
          for (ulong* a = (ulong*)(M+SSTART-16); a >= (ulong*)SP; a-=2) {
            ulong idx = (a-SP)/2;
@@ -332,31 +342,35 @@ void collect() {
       break;
     }
   }
-  fprintf(logfilefd, "}\n");
+  SANITY(fprintf(logfilefd, "}\n"));
 
   while (scan < HP) {
     ulong tag = TAG_MASK(FST(scan));
     switch (tag) {
     case CONS_TAG:
     case PROC_TAG:
-      if (ADDR_MASK(FST(scan)) != 0)
-        fprintf(logfilefd, "\"%llx\" -> \"%llx\" [color=\"red:magenta\"];\n",
-                scan,
-                (ulong) ADDR_MASK(FST(scan)));
-      if (ADDR_MASK(SND(scan)) != 0)
-        fprintf(logfilefd, "\"%llx\" -> \"%llx\" [color=\"red:royalblue\"];\n",
-                scan,
-                (ulong) ADDR_MASK(SND(scan)));
+      SANITY(
+       if (ADDR_MASK(FST(scan)) != 0)
+         fprintf(logfilefd, "\"%llx\" -> \"%llx\" [color=\"red:magenta\"];\n",
+                 scan,
+                 (ulong) ADDR_MASK(FST(scan)));
+       if (ADDR_MASK(SND(scan)) != 0)
+         fprintf(logfilefd, "\"%llx\" -> \"%llx\" [color=\"red:royalblue\"];\n",
+                 scan,
+                 (ulong) ADDR_MASK(SND(scan)));
+             );
       FST(scan) = (ulong)copy(ADDR_MASK(FST(scan))) | tag;
       SND(scan) = copy(SND(scan));
-      if (ADDR_MASK(FST(scan)) != 0)
-        fprintf(logfilefd, "\"%llx\" -> \"%llx\" [color=\"black:magenta\"];\n",
-                scan,
-                (ulong) ADDR_MASK(FST(scan)));
-      if (ADDR_MASK(SND(scan)) != 0)
-        fprintf(logfilefd, "\"%llx\" -> \"%llx\" [color=\"black:royalblue\"];\n",
-                scan,
-                (ulong) ADDR_MASK(SND(scan)));
+      SANITY(
+       if (ADDR_MASK(FST(scan)) != 0)
+         fprintf(logfilefd, "\"%llx\" -> \"%llx\" [color=\"black:magenta\"];\n",
+                 scan,
+                 (ulong) ADDR_MASK(FST(scan)));
+       if (ADDR_MASK(SND(scan)) != 0)
+         fprintf(logfilefd, "\"%llx\" -> \"%llx\" [color=\"black:royalblue\"];\n",
+                 scan,
+                 (ulong) ADDR_MASK(SND(scan)));
+             );
       break;
     default:
       break;
@@ -991,8 +1005,38 @@ void p_load (void) {
 void p_store (void) {
   if (TAG_MASK(*SP) != INT_TAG || TAG_MASK(*(SP+2)) != INT_TAG) panic("Non-int in store");
   ulong* addr = (ulong*) *(SP+1);
-  SP+=2;
-  *addr = *(SP+1);
+  *addr = *(SP+3);
+  SP+=4;
+}
+void p_load_b (void) {
+  if (TAG_MASK(*SP) != INT_TAG) panic("Non-int in load");
+  *(SP+1) = *((unsigned char*) *(SP+1));
+}
+void p_store_b (void) {
+  if (TAG_MASK(*SP) != INT_TAG || TAG_MASK(*(SP+2)) != INT_TAG) panic("Non-int in store");
+  unsigned char* addr = (unsigned char*) *(SP+1);
+  *addr = *(unsigned char*)(SP+3);
+  SP+=4;
+}
+void p_load_2b (void) {
+  if (TAG_MASK(*SP) != INT_TAG) panic("Non-int in load");
+  *(SP+1) = *((unsigned short*) *(SP+1));
+}
+void p_store_2b (void) {
+  if (TAG_MASK(*SP) != INT_TAG || TAG_MASK(*(SP+2)) != INT_TAG) panic("Non-int in store");
+  unsigned short* addr = (unsigned short*) *(SP+1);
+  *addr = *(unsigned short*)(SP+3);
+  SP+=4;
+}
+void p_load_4b (void) {
+  if (TAG_MASK(*SP) != INT_TAG) panic("Non-int in load");
+  *(SP+1) = *((unsigned int*) *(SP+1));
+}
+void p_store_4b (void) {
+  if (TAG_MASK(*SP) != INT_TAG || TAG_MASK(*(SP+2)) != INT_TAG) panic("Non-int in store");
+  unsigned int* addr = (unsigned int*) *(SP+1);
+  *addr = *(unsigned int*)(SP+3);
+  SP+=4;
 }
 
 ulong* env_define_prim(ulong* env, char* raw_sym, stack_func prim) {
@@ -1007,6 +1051,7 @@ void strcpy_inc(char** dest, char* src) {
 }
 
 int forsp_main() {
+  M = &MAINMEM;
   ASSERT(((ulong)M & 0xf) == 0, "Memory base isn't 16byte aligned!");
 
   SP = M+SSTART;
@@ -1083,6 +1128,12 @@ int forsp_main() {
 
   BAKE_DEF("load", p_load);
   BAKE_DEF("store", p_store);
+  BAKE_DEF("load_b", p_load_b);
+  BAKE_DEF("store_b", p_store_b);
+  BAKE_DEF("load_2b", p_load_2b);
+  BAKE_DEF("store_2b", p_store_2b);
+  BAKE_DEF("load_4b", p_load_4b);
+  BAKE_DEF("store_4b", p_store_4b);
 
   DP = dict;
 

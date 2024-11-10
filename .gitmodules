@@ -1,3 +1,9 @@
 [submodule "fpir/musl"]
 	path = fpir/musl
 	url = git://git.musl-libc.org/musl
+[submodule "fpir/musl-riscv"]
+	path = fpir/musl-riscv
+	url = git://git.musl-libc.org/musl
+[submodule "fpir/musl-cross-make"]
+	path = fpir/musl-cross-make
+	url = https://github.com/richfelker/musl-cross-make
