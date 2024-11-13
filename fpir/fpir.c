@@ -40,8 +40,8 @@
 
 // #include <sys/cdefs.h>
 
-// #define SANITY_CHECKS_ENABLED
-#define BAREMETAL
+#define SANITY_CHECKS_ENABLED
+// #define BAREMETAL
 
 #ifdef SANITY_CHECKS_ENABLED
 #define SANITY(body)                            \
@@ -1051,7 +1051,9 @@ void strcpy_inc(char** dest, char* src) {
 }
 
 int forsp_main() {
+#ifdef BAREMETAL
   M = &MAINMEM;
+#endif
   ASSERT(((ulong)M & 0xf) == 0, "Memory base isn't 16byte aligned!");
 
   SP = M+SSTART;
